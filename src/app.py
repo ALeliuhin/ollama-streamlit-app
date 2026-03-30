@@ -55,8 +55,48 @@ def chat_stream(model: str, messages: list[dict]) -> Iterator[str]:
 
 
 def init_session() -> None:
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+    # Backwards compatibility: migrate legacy single-chat messages, if any.
+    legacy_messages = st.session_state.get("messages")
+
+    if "chats" not in st.session_state:
+        st.session_state.chats: dict[int, dict] = {}
+    if "next_chat_id" not in st.session_state:
+        st.session_state.next_chat_id = 1
+    if "active_chat_id" not in st.session_state:
+        st.session_state.active_chat_id: int | None = None
+
+    # Helper to create an empty chat.
+    def _create_chat(name: str | None = None) -> int:
+        chat_id = st.session_state.next_chat_id
+        st.session_state.next_chat_id += 1
+        if name is None:
+            name = f"Chat {chat_id}"
+        st.session_state.chats[chat_id] = {"id": chat_id, "name": name, "messages": []}
+        st.session_state.active_chat_id = chat_id
+        return chat_id
+
+    # If there are no chats yet, create the first one.
+    if not st.session_state.chats:
+        first_id = _create_chat("Chat 1")
+        # Migrate old single-chat history if present.
+        if isinstance(legacy_messages, list) and legacy_messages:
+            st.session_state.chats[first_id]["messages"].extend(legacy_messages)
+        # Remove legacy key to avoid confusion.
+        if "messages" in st.session_state:
+            del st.session_state["messages"]
+
+
+def get_active_chat() -> dict:
+    """Return the currently active chat dict, creating one if needed."""
+    if "chats" not in st.session_state or not st.session_state.chats:
+        init_session()
+
+    active_id = st.session_state.get("active_chat_id")
+    if active_id is None or active_id not in st.session_state.chats:
+        # Pick an arbitrary existing chat as active.
+        active_id = sorted(st.session_state.chats.keys())[0]
+        st.session_state.active_chat_id = active_id
+    return st.session_state.chats[active_id]
 
 
 def main() -> None:
@@ -113,6 +153,59 @@ def main() -> None:
         elif list_error is None:
             st.caption("No models yet — run `ollama pull <name>` in a terminal.")
 
+        st.divider()
+        st.subheader("Chats")
+
+        # Chat selection and management
+        chats = st.session_state.chats
+        chat_ids = sorted(chats.keys())
+
+        if chat_ids:
+            current_active = st.session_state.get("active_chat_id", chat_ids[0])
+            try:
+                current_index = chat_ids.index(current_active)
+            except ValueError:
+                current_index = 0
+                st.session_state.active_chat_id = chat_ids[0]
+
+            selected_id = st.radio(
+                "Select chat",
+                options=chat_ids,
+                index=current_index,
+                key="chat_selector",
+                format_func=lambda cid: chats[cid]["name"],
+            )
+            if selected_id != st.session_state.active_chat_id:
+                st.session_state.active_chat_id = selected_id
+                st.rerun()
+
+        col_new, col_delete = st.columns(2)
+        with col_new:
+            if st.button("New chat", use_container_width=True):
+                # Create a new, empty chat.
+                new_id = st.session_state.next_chat_id
+                st.session_state.next_chat_id += 1
+                name = f"Chat {new_id}"
+                st.session_state.chats[new_id] = {"id": new_id, "name": name, "messages": []}
+                st.session_state.active_chat_id = new_id
+                st.rerun()
+
+        with col_delete:
+            # Only allow deleting if more than one chat exists to avoid ending up with none.
+            disabled = len(st.session_state.chats) <= 1
+            if st.button(
+                "Delete chat",
+                use_container_width=True,
+                disabled=disabled,
+                help="Delete the current chat. At least one chat must remain.",
+            ):
+                active_id = st.session_state.get("active_chat_id")
+                if active_id in st.session_state.chats and len(st.session_state.chats) > 1:
+                    del st.session_state.chats[active_id]
+                    remaining_ids = sorted(st.session_state.chats.keys())
+                    st.session_state.active_chat_id = remaining_ids[0]
+                st.rerun()
+
     if list_error:
         st.warning(f"Model list unavailable ({list_error}). Start Ollama from the sidebar.")
 
@@ -126,7 +219,10 @@ def main() -> None:
         )
         st.caption(f"Using **{model}**")
 
-    for msg in st.session_state.messages:
+    active_chat = get_active_chat()
+    messages = active_chat["messages"]
+
+    for msg in messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
@@ -135,7 +231,7 @@ def main() -> None:
         return
 
     if prompt := st.chat_input("Message"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
@@ -143,16 +239,16 @@ def main() -> None:
             placeholder = st.empty()
             full = ""
             try:
-                for piece in chat_stream(model, st.session_state.messages):
+                for piece in chat_stream(model, messages):
                     full += piece
                     placeholder.markdown(full + "▌")
                 placeholder.markdown(full)
             except Exception as e:
                 placeholder.error(str(e))
-                st.session_state.messages.pop()
+                messages.pop()
                 return
 
-        st.session_state.messages.append({"role": "assistant", "content": full})
+        messages.append({"role": "assistant", "content": full})
         st.rerun()
 
 

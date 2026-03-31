@@ -29,6 +29,6 @@ uv run -m src.app
 
 # Add alias to .bashrc
 ```bash
-printf "\nalias ollama-ui='cd /home/aleliuhin/Study/Extra/LLM/Ollama-UI && uv run -m src.app'\n" >> ~/.bashrc
+printf "\nalias ollama-ui='cd <path_to_ollama-streamlit-app> && uv run -m src.app'\n" >> ~/.bashrc
 source ~/.bashrc
 ```

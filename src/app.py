@@ -10,6 +10,19 @@ import streamlit as st
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
 
+def ollama_stop(model: str) -> tuple[int, str, str]:
+    """Stop/unload a model via `ollama stop <model>`."""
+    model = (model or "").strip()
+    if not model:
+        return 0, "", ""
+    result = subprocess.run(
+        ["ollama", "stop", model],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
+
 
 def _ollama_client() -> ollama.Client:
     return ollama.Client(host=OLLAMA_HOST)
@@ -45,9 +58,12 @@ def list_models() -> list[str]:
     return sorted(names)
 
 
-def chat_stream(model: str, messages: list[dict]) -> Iterator[str]:
+def chat_stream(model: str, messages: list[dict], *, keep_alive: int | str | None = None) -> Iterator[str]:
     client = _ollama_client()
-    stream = client.chat(model=model, messages=messages, stream=True)
+    kwargs = {}
+    if keep_alive is not None:
+        kwargs["keep_alive"] = keep_alive
+    stream = client.chat(model=model, messages=messages, stream=True, **kwargs)
     for chunk in stream:
         piece = chunk.message.content if chunk.message else None
         if piece:
@@ -206,17 +222,38 @@ def main() -> None:
                     st.session_state.active_chat_id = remaining_ids[0]
                 st.rerun()
 
+        st.divider()
+        st.subheader("Model runtime")
+        unload_after_response = st.toggle(
+            "Unload after each response",
+            value=bool(st.session_state.get("unload_after_response", False)),
+            help=(
+                "If enabled, the model will be unloaded after it finishes responding. "
+                "This reduces parallel models in `ollama ps`, but may increase latency for the next message."
+            ),
+        )
+        st.session_state.unload_after_response = unload_after_response
+
     if list_error:
         st.warning(f"Model list unavailable ({list_error}). Start Ollama from the sidebar.")
 
     model = ""
     if models:
+        previous_model = st.session_state.get("active_model_name", "")
         model = st.selectbox(
             "Chat model",
             options=models,
             index=0,
             key="ollama_chat_model",
         )
+        if model != previous_model:
+            if previous_model:
+                code, out, err = ollama_stop(previous_model)
+                if code != 0:
+                    st.toast(f"Failed to stop {previous_model}: {err or out or f'Exit {code}'}")
+                else:
+                    st.toast(f"Stopped {previous_model}")
+            st.session_state.active_model_name = model
         st.caption(f"Using **{model}**")
 
     active_chat = get_active_chat()
@@ -239,7 +276,9 @@ def main() -> None:
             placeholder = st.empty()
             full = ""
             try:
-                for piece in chat_stream(model, messages):
+                st.session_state.active_generation_model = model
+                keep_alive = 0 if st.session_state.get("unload_after_response") else None
+                for piece in chat_stream(model, messages, keep_alive=keep_alive):
                     full += piece
                     placeholder.markdown(full + "▌")
                 placeholder.markdown(full)
@@ -247,6 +286,10 @@ def main() -> None:
                 placeholder.error(str(e))
                 messages.pop()
                 return
+            finally:
+                st.session_state.active_generation_model = ""
+                if st.session_state.get("unload_after_response"):
+                    ollama_stop(model)
 
         messages.append({"role": "assistant", "content": full})
         st.rerun()
@@ -258,7 +301,7 @@ if __name__ == "__main__":
 
     import streamlit.runtime as st_runtime
 
-    # `uv run app.py` / `python app.py` are not inside Streamlit — re-invoke properly.
+    # `uv run -m src.app`
     if not st_runtime.exists():
         sys.exit(
             subprocess.call([sys.executable, "-m", "streamlit", "run", __file__, *sys.argv[1:]])

@@ -2,6 +2,8 @@
 
 This is a Streamlit UI for local Ollama. It allows you to control the Ollama service, list available models, and chat with the models.
 
+**Note**: Tested on Linux Mint 22.
+
 # Installation
 
 Install uv
@@ -12,6 +14,7 @@ curl -fsSL https://astral.sh/uv/install.sh | sh
 Clone the repository
 ```bash
 git clone https://github.com/ALeliuhin/ollama-streamlit-app.git
+cd ollama-streamlit-app
 ```
 Install dependencies
 ```bash
@@ -22,4 +25,10 @@ uv sync
 
 ```bash
 uv run -m src.app
+```
+
+# Add alias to .bashrc
+```bash
+printf "\nalias ollama-ui='cd /home/aleliuhin/Study/Extra/LLM/Ollama-UI && uv run -m src.app'\n" >> ~/.bashrc
+source ~/.bashrc
 ```

@@ -124,6 +124,7 @@ def main() -> None:
 
     models: list[str] = []
     list_error: str | None = None
+    model = ""
     with st.sidebar:
         st.subheader("Ollama service")
         col_a, col_b = st.columns(2)
@@ -164,8 +165,22 @@ def main() -> None:
             list_error = None
 
         if models:
-            for name in models:
-                st.text(name)
+            previous_model = st.session_state.get("active_model_name", "")
+            model = st.selectbox(
+                "Chat model",
+                options=models,
+                index=0,
+                key="ollama_chat_model",
+            )
+            if model != previous_model:
+                if previous_model:
+                    code, out, err = ollama_stop(previous_model)
+                    if code != 0:
+                        st.toast(f"Failed to stop {previous_model}: {err or out or f'Exit {code}'}")
+                    else:
+                        st.toast(f"Stopped {previous_model}")
+                st.session_state.active_model_name = model
+            st.caption(f"Using **{model}**")
         elif list_error is None:
             st.caption("No models yet — run `ollama pull <name>` in a terminal.")
 
@@ -236,25 +251,6 @@ def main() -> None:
 
     if list_error:
         st.warning(f"Model list unavailable ({list_error}). Start Ollama from the sidebar.")
-
-    model = ""
-    if models:
-        previous_model = st.session_state.get("active_model_name", "")
-        model = st.selectbox(
-            "Chat model",
-            options=models,
-            index=0,
-            key="ollama_chat_model",
-        )
-        if model != previous_model:
-            if previous_model:
-                code, out, err = ollama_stop(previous_model)
-                if code != 0:
-                    st.toast(f"Failed to stop {previous_model}: {err or out or f'Exit {code}'}")
-                else:
-                    st.toast(f"Stopped {previous_model}")
-            st.session_state.active_model_name = model
-        st.caption(f"Using **{model}**")
 
     active_chat = get_active_chat()
     messages = active_chat["messages"]

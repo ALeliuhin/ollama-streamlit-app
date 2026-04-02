@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Iterator
+from typing import Any, Iterator
 
 import ollama
+import pandas as pd
 import streamlit as st
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
@@ -51,11 +52,165 @@ def ollama_service_active() -> bool | None:
     return None
 
 
-def list_models() -> list[str]:
-    client = _ollama_client()
-    response = client.list()
-    names = [m.model for m in response.models if m.model]
-    return sorted(names)
+def list_models_raw() -> tuple[list[Any], str | None]:
+    """Return (models from Ollama list(), None) or ([], error_message)."""
+    try:
+        client = _ollama_client()
+        response = client.list()
+        return list(response.models), None
+    except Exception as e:
+        return [], str(e)
+
+
+def _fmt_bytes(n: int | None) -> str:
+    if n is None:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0:
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PB"
+
+
+def _models_to_dataframe(models: list[Any]) -> pd.DataFrame:
+    rows = []
+    for m in models:
+        d = getattr(m, "details", None)
+        rows.append(
+            {
+                "name": m.model or "—",
+                "size": _fmt_bytes(m.size),
+                "size_bytes": m.size,
+                "modified": m.modified_at.isoformat() if m.modified_at else "—",
+                "format": (getattr(d, "format", None) or "—") if d else "—",
+                "family": (getattr(d, "family", None) or "—") if d else "—",
+                "parameter_size": (getattr(d, "parameter_size", None) or "—") if d else "—",
+                "quantization": (getattr(d, "quantization_level", None) or "—") if d else "—",
+                "digest": (m.digest[:16] + "…") if m.digest and len(m.digest) > 16 else (m.digest or "—"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_pull_with_progress(client: ollama.Client, model_name: str) -> tuple[bool, str]:
+    """Stream pull progress into Streamlit widgets. Returns (ok, message)."""
+    progress = st.progress(0.0, text="Starting…")
+    status_box = st.empty()
+    last_line = ""
+    try:
+        stream = client.pull(model_name.strip(), stream=True)
+        for chunk in stream:
+            line = chunk.status or ""
+            if line:
+                last_line = line
+                status_box.caption(line)
+            if chunk.total and chunk.total > 0 and chunk.completed is not None:
+                frac = min(float(chunk.completed) / float(chunk.total), 1.0)
+                pct = int(100 * frac)
+                progress.progress(frac, text=f"{pct}% ({_fmt_bytes(chunk.completed)} / {_fmt_bytes(chunk.total)})")
+            elif line:
+                progress.progress(0.0, text=line[:80])
+        progress.progress(1.0, text="Complete")
+        return True, last_line or "Done"
+    except Exception as e:
+        progress.progress(0.0, text="Failed")
+        return False, str(e)
+
+
+def render_model_library_panel(client: ollama.Client, models: list[Any], list_error: str | None) -> None:
+    """Right-docked panel: pull models, progress, and property table."""
+    st.subheader("Model library")
+    st.caption("Pull new models and inspect installed weights.")
+
+    if list_error:
+        st.warning(f"Cannot list models: {list_error}")
+
+    with st.form("pull_model_form", clear_on_submit=False):
+        pull_name = st.text_input(
+            "Model name",
+            placeholder="e.g. llama3.2 or qwen2.5:7b",
+            help="Same name you would pass to `ollama pull` on the CLI.",
+        )
+        submitted = st.form_submit_button("Pull", use_container_width=True)
+
+    if submitted:
+        name = (pull_name or "").strip()
+        if not name:
+            st.warning("Enter a model name to pull.")
+        else:
+            ok, msg = run_pull_with_progress(client, name)
+            if ok:
+                st.success(f"Finished pulling **{name}**.")
+            else:
+                st.error(msg)
+            st.rerun()
+
+    st.divider()
+    st.markdown("**Installed models**")
+
+    if list_error and not models:
+        st.caption("Connect Ollama to see installed models here.")
+        return
+
+    if not models:
+        st.caption("No models yet — pull one above.")
+        return
+
+    df = _models_to_dataframe(models)
+    st.dataframe(
+        df.drop(columns=["size_bytes"], errors="ignore"),
+        use_container_width=True,
+        hide_index=True,
+        height=min(280, 36 + len(models) * 36),
+    )
+
+    names = [m.model for m in models if m.model]
+    if not names:
+        return
+
+    detail_name = st.selectbox("Inspect details", options=sorted(names), key="inspect_model_select")
+    if st.button("Load details", key="load_show_details"):
+        try:
+            st.session_state["ollama_show_payload"] = client.show(detail_name)
+            st.session_state["ollama_show_for"] = detail_name
+            st.session_state.pop("ollama_show_err", None)
+        except Exception as e:
+            st.session_state["ollama_show_payload"] = None
+            st.session_state["ollama_show_err"] = str(e)
+
+    err = st.session_state.get("ollama_show_err")
+    if err:
+        st.error(err)
+
+    info = st.session_state.get("ollama_show_payload")
+    cached_for = st.session_state.get("ollama_show_for")
+    if info is None or cached_for != detail_name:
+        st.caption("Pick a model and click **Load details** for full `ollama show` metadata.")
+        return
+
+    st.markdown(f"**{detail_name}**")
+
+    det = getattr(info, "details", None)
+    if det:
+        if hasattr(det, "model_dump"):
+            d = det.model_dump()
+        else:
+            d = dict(det) if det else {}
+        st.json({k: v for k, v in d.items() if v not in (None, "", [])})
+
+    caps = getattr(info, "capabilities", None)
+    if caps:
+        st.caption("Capabilities: " + ", ".join(caps))
+
+    mi = getattr(info, "modelinfo", None)
+    if mi:
+        with st.expander("Model info (GGUF metadata)", expanded=False):
+            st.json(mi if isinstance(mi, dict) else dict(mi))
+
+    modelfile = getattr(info, "modelfile", None)
+    if modelfile:
+        with st.expander("Modelfile", expanded=False):
+            st.code(modelfile[:8000] + ("…" if len(modelfile) > 8000 else ""), language="dockerfile")
 
 
 def chat_stream(model: str, messages: list[dict], *, keep_alive: int | str | None = None) -> Iterator[str]:
@@ -80,6 +235,8 @@ def init_session() -> None:
         st.session_state.next_chat_id = 1
     if "active_chat_id" not in st.session_state:
         st.session_state.active_chat_id: int | None = None
+    if "model_dock_open" not in st.session_state:
+        st.session_state.model_dock_open = False
 
     # Helper to create an empty chat.
     def _create_chat(name: str | None = None) -> int:
@@ -119,11 +276,13 @@ def main() -> None:
     st.set_page_config(page_title="Ollama UI", page_icon="🦙", layout="wide")
     init_session()
 
+    models_raw, list_error = list_models_raw()
+    model_names = sorted([m.model for m in models_raw if m.model])
+    client = _ollama_client()
+
     st.title("Ollama")
     st.caption("Local models · systemd service · streaming chat")
 
-    models: list[str] = []
-    list_error: str | None = None
     model = ""
     with st.sidebar:
         st.subheader("Ollama service")
@@ -155,20 +314,15 @@ def main() -> None:
 
         st.divider()
         st.subheader("Downloaded models")
-        try:
-            models = list_models()
-        except Exception as e:
-            list_error = str(e)
+        if list_error:
             st.caption(f"Cannot reach Ollama at `{OLLAMA_HOST}`. Is the daemon running?")
             st.caption(list_error)
-        else:
-            list_error = None
 
-        if models:
+        if model_names:
             previous_model = st.session_state.get("active_model_name", "")
             model = st.selectbox(
                 "Chat model",
-                options=models,
+                options=model_names,
                 index=0,
                 key="ollama_chat_model",
             )
@@ -182,7 +336,7 @@ def main() -> None:
                 st.session_state.active_model_name = model
             st.caption(f"Using **{model}**")
         elif list_error is None:
-            st.caption("No models yet — run `ollama pull <name>` in a terminal.")
+            st.caption("No models yet — open **Models** on the right edge of the page, or run `ollama pull` in a terminal.")
 
         st.divider()
         st.subheader("Chats")
@@ -249,46 +403,85 @@ def main() -> None:
         )
         st.session_state.unload_after_response = unload_after_response
 
-    if list_error:
-        st.warning(f"Model list unavailable ({list_error}). Start Ollama from the sidebar.")
+    if model_names:
+        model = st.session_state.get("ollama_chat_model", model_names[0])
 
-    active_chat = get_active_chat()
-    messages = active_chat["messages"]
+    dock_open = st.session_state.get("model_dock_open", False)
+    if dock_open:
+        col_chat, col_models = st.columns([2.05, 1], gap="large")
+        col_edge = None
+    else:
+        col_chat, col_edge = st.columns([12, 1], gap="small")
+        col_models = None
 
-    for msg in messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    with col_chat:
+        if list_error:
+            st.warning(f"Model list unavailable ({list_error}). Start Ollama from the sidebar.")
 
-    if not models:
-        st.info("Start the Ollama service and ensure at least one model is downloaded.")
-        return
+        active_chat = get_active_chat()
+        messages = active_chat["messages"]
 
-    if prompt := st.chat_input("Message"):
-        messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        for msg in messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            full = ""
-            try:
-                st.session_state.active_generation_model = model
-                keep_alive = 0 if st.session_state.get("unload_after_response") else None
-                for piece in chat_stream(model, messages, keep_alive=keep_alive):
-                    full += piece
-                    placeholder.markdown(full + "▌")
-                placeholder.markdown(full)
-            except Exception as e:
-                placeholder.error(str(e))
-                messages.pop()
-                return
-            finally:
-                st.session_state.active_generation_model = ""
-                if st.session_state.get("unload_after_response"):
-                    ollama_stop(model)
+        if not model_names:
+            st.info(
+                "Start the Ollama service, then download a model from the **Models** panel "
+                "(click **Models** on the right edge of the window). You can pull before any model exists."
+            )
 
-        messages.append({"role": "assistant", "content": full})
-        st.rerun()
+        if model_names and (prompt := st.chat_input("Message")):
+            messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                full = ""
+                try:
+                    st.session_state.active_generation_model = model
+                    keep_alive = 0 if st.session_state.get("unload_after_response") else None
+                    for piece in chat_stream(model, messages, keep_alive=keep_alive):
+                        full += piece
+                        placeholder.markdown(full + "▌")
+                    placeholder.markdown(full)
+                except Exception as e:
+                    placeholder.error(str(e))
+                    messages.pop()
+                else:
+                    messages.append({"role": "assistant", "content": full})
+                    st.rerun()
+                finally:
+                    st.session_state.active_generation_model = ""
+                    if st.session_state.get("unload_after_response"):
+                        ollama_stop(model)
+
+    if col_edge is not None:
+        with col_edge:
+            if st.button(
+                "Models",
+                key="open_model_dock",
+                use_container_width=True,
+                help="Open model library: pull models and inspect metadata.",
+            ):
+                st.session_state.model_dock_open = True
+                st.rerun()
+
+    if col_models is not None:
+        with col_models:
+            close_l, close_r = st.columns([3, 1])
+            with close_r:
+                if st.button(
+                    "Close",
+                    key="close_model_dock",
+                    use_container_width=True,
+                    help="Hide the model library panel.",
+                ):
+                    st.session_state.model_dock_open = False
+                    st.rerun()
+            with st.container(border=True):
+                render_model_library_panel(client, models_raw, list_error)
 
 
 if __name__ == "__main__":

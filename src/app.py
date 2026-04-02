@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 import ollama
 import pandas as pd
@@ -260,16 +260,48 @@ def render_model_library_panel(client: ollama.Client, models: list[Any], list_er
             st.code(modelfile[:8000] + ("…" if len(modelfile) > 8000 else ""), language="dockerfile")
 
 
-def chat_stream(model: str, messages: list[dict], *, keep_alive: int | str | None = None) -> Iterator[str]:
+def chat_stream(
+    model: str,
+    messages: list[dict],
+    *,
+    keep_alive: int | str | None = None,
+    think: bool | Literal["low", "medium", "high"] | None = True,
+) -> Iterator[tuple[Literal["thinking", "content"], str]]:
+    """Stream chat tokens.
+
+    Yields ``("thinking", piece)`` for reasoning traces and ``("content", piece)`` for the reply.
+    With ``think`` enabled, thinking-capable models emit ``message.thinking`` chunks; others only
+    yield ``content`` pieces.
+    """
     client = _ollama_client()
-    kwargs = {}
+    kwargs: dict[str, Any] = {}
     if keep_alive is not None:
         kwargs["keep_alive"] = keep_alive
+    if think is not None:
+        kwargs["think"] = think
     stream = client.chat(model=model, messages=messages, stream=True, **kwargs)
     for chunk in stream:
-        piece = chunk.message.content if chunk.message else None
-        if piece:
-            yield piece
+        msg = chunk.message
+        if not msg:
+            continue
+        t = getattr(msg, "thinking", None)
+        if t:
+            yield "thinking", t
+        c = getattr(msg, "content", None)
+        if c:
+            yield "content", c
+
+
+def _format_assistant_stream_markdown(thinking: str, content: str) -> str:
+    parts: list[str] = []
+    if thinking:
+        parts.append("**Thinking**\n\n")
+        parts.append(thinking)
+    if content:
+        if thinking:
+            parts.append("\n\n---\n\n")
+        parts.append(content)
+    return "".join(parts)
 
 
 def init_session() -> None:
@@ -485,13 +517,20 @@ def main() -> None:
 
             with st.chat_message("assistant"):
                 placeholder = st.empty()
-                full = ""
+                thinking_buf = ""
+                content_buf = ""
                 try:
                     st.session_state.active_generation_model = model
                     keep_alive = 0 if st.session_state.get("unload_after_response") else None
-                    for piece in chat_stream(model, messages, keep_alive=keep_alive):
-                        full += piece
-                        placeholder.markdown(full + "▌")
+                    for kind, piece in chat_stream(model, messages, keep_alive=keep_alive):
+                        if kind == "thinking":
+                            thinking_buf += piece
+                        else:
+                            content_buf += piece
+                        placeholder.markdown(
+                            _format_assistant_stream_markdown(thinking_buf, content_buf) + "▌"
+                        )
+                    full = _format_assistant_stream_markdown(thinking_buf, content_buf)
                     placeholder.markdown(full)
                 except Exception as e:
                     placeholder.error(str(e))

@@ -92,29 +92,76 @@ def _models_to_dataframe(models: list[Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _run_pull_stream_api(client: ollama.Client, model_name: str, progress: Any, status_box: Any) -> tuple[bool, str]:
+    """Stream pull via Ollama HTTP API (works when the real daemon is up)."""
+    last_line = ""
+    stream = client.pull(model_name.strip(), stream=True)
+    for chunk in stream:
+        line = getattr(chunk, "status", None) or ""
+        if line:
+            last_line = line
+            status_box.caption(line)
+        total = getattr(chunk, "total", None)
+        completed = getattr(chunk, "completed", None)
+        if total and total > 0 and completed is not None:
+            frac = min(float(completed) / float(total), 1.0)
+            pct = int(100 * frac)
+            progress.progress(
+                frac,
+                text=f"{pct}% ({_fmt_bytes(completed)} / {_fmt_bytes(total)})",
+            )
+        elif line:
+            progress.progress(0.0, text=line[:80])
+    progress.progress(1.0, text="Complete")
+    return True, last_line or "Done"
+
+
 def run_pull_with_progress(client: ollama.Client, model_name: str) -> tuple[bool, str]:
-    """Stream pull progress into Streamlit widgets. Returns (ok, message)."""
+    """Prefer `ollama pull` CLI; if that fails (e.g. distro stub prints ollama.com), use HTTP API."""
+    model_name = (model_name or "").strip()
     progress = st.progress(0.0, text="Starting…")
     status_box = st.empty()
     last_line = ""
+    cli_note = ""
+
     try:
-        stream = client.pull(model_name.strip(), stream=True)
-        for chunk in stream:
-            line = chunk.status or ""
-            if line:
-                last_line = line
-                status_box.caption(line)
-            if chunk.total and chunk.total > 0 and chunk.completed is not None:
-                frac = min(float(chunk.completed) / float(chunk.total), 1.0)
-                pct = int(100 * frac)
-                progress.progress(frac, text=f"{pct}% ({_fmt_bytes(chunk.completed)} / {_fmt_bytes(chunk.total)})")
-            elif line:
-                progress.progress(0.0, text=line[:80])
-        progress.progress(1.0, text="Complete")
-        return True, last_line or "Done"
+        proc = subprocess.Popen(
+            ["ollama", "pull", model_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        if proc.stdout is None:
+            cli_note = "Could not capture `ollama pull` output."
+        else:
+            for raw in proc.stdout:
+                line = raw.strip()
+                if line:
+                    last_line = line
+                    status_box.caption(line)
+                    progress.progress(0.0, text=line[:120])
+            code = proc.wait()
+            if code == 0:
+                progress.progress(1.0, text="Complete")
+                return True, last_line or "Done"
+            cli_note = last_line or f"CLI exited with code {code}"
+    except FileNotFoundError:
+        cli_note = "`ollama` not found on PATH."
+    except Exception as e:
+        cli_note = str(e)
+
+    # Many Linux installs ship a stub `ollama` that only prints https://ollama.com/download — use API if daemon works.
+    status_box.caption("CLI pull did not finish. Trying Ollama API (same as a working `ollama serve`)…")
+    try:
+        _ok, msg = _run_pull_stream_api(client, model_name, progress, status_box)
+        return True, msg
     except Exception as e:
         progress.progress(0.0, text="Failed")
-        return False, str(e)
+        hint = ""
+        if "ollama.com" in (cli_note or "").lower():
+            hint = " Your `ollama` command may be a stub; install the real binary from https://ollama.com/download or use a working daemon."
+        return False, f"{cli_note} | API: {e}.{hint}"
 
 
 def render_model_library_panel(client: ollama.Client, models: list[Any], list_error: str | None) -> None:
@@ -131,7 +178,7 @@ def render_model_library_panel(client: ollama.Client, models: list[Any], list_er
             placeholder="e.g. llama3.2 or qwen2.5:7b",
             help="Same name you would pass to `ollama pull` on the CLI.",
         )
-        submitted = st.form_submit_button("Pull", use_container_width=True)
+        submitted = st.form_submit_button("Pull", width="stretch")
 
     if submitted:
         name = (pull_name or "").strip()
@@ -141,9 +188,9 @@ def render_model_library_panel(client: ollama.Client, models: list[Any], list_er
             ok, msg = run_pull_with_progress(client, name)
             if ok:
                 st.success(f"Finished pulling **{name}**.")
+                st.rerun()
             else:
                 st.error(msg)
-            st.rerun()
 
     st.divider()
     st.markdown("**Installed models**")
@@ -159,7 +206,7 @@ def render_model_library_panel(client: ollama.Client, models: list[Any], list_er
     df = _models_to_dataframe(models)
     st.dataframe(
         df.drop(columns=["size_bytes"], errors="ignore"),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         height=min(280, 36 + len(models) * 36),
     )
@@ -288,7 +335,7 @@ def main() -> None:
         st.subheader("Ollama service")
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("Start", use_container_width=True, help="systemctl start ollama"):
+            if st.button("Start", width="stretch", help="systemctl start ollama"):
                 code, out, err = run_systemctl("start")
                 if code == 0:
                     st.success("Started.")
@@ -296,7 +343,7 @@ def main() -> None:
                     st.error(err or out or f"Exit {code}")
                 st.rerun()
         with col_b:
-            if st.button("Stop", use_container_width=True, help="systemctl stop ollama"):
+            if st.button("Stop", width="stretch", help="systemctl stop ollama"):
                 code, out, err = run_systemctl("stop")
                 if code == 0:
                     st.success("Stopped.")
@@ -366,7 +413,7 @@ def main() -> None:
 
         col_new, col_delete = st.columns(2)
         with col_new:
-            if st.button("New chat", use_container_width=True):
+            if st.button("New chat", width="stretch"):
                 # Create a new, empty chat.
                 new_id = st.session_state.next_chat_id
                 st.session_state.next_chat_id += 1
@@ -380,7 +427,7 @@ def main() -> None:
             disabled = len(st.session_state.chats) <= 1
             if st.button(
                 "Delete chat",
-                use_container_width=True,
+                width="stretch",
                 disabled=disabled,
                 help="Delete the current chat. At least one chat must remain.",
             ):
@@ -462,7 +509,7 @@ def main() -> None:
             if st.button(
                 "Models",
                 key="open_model_dock",
-                use_container_width=True,
+                width="stretch",
                 help="Open model library: pull models and inspect metadata.",
             ):
                 st.session_state.model_dock_open = True
@@ -475,7 +522,7 @@ def main() -> None:
                 if st.button(
                     "Close",
                     key="close_model_dock",
-                    use_container_width=True,
+                    width="stretch",
                     help="Hide the model library panel.",
                 ):
                     st.session_state.model_dock_open = False

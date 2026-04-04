@@ -265,13 +265,14 @@ def chat_stream(
     messages: list[dict],
     *,
     keep_alive: int | str | None = None,
-    think: bool | Literal["low", "medium", "high"] | None = True,
+    think: bool | Literal["low", "medium", "high"] | None = None,
 ) -> Iterator[tuple[Literal["thinking", "content"], str]]:
     """Stream chat tokens.
 
     Yields ``("thinking", piece)`` for reasoning traces and ``("content", piece)`` for the reply.
-    With ``think`` enabled, thinking-capable models emit ``message.thinking`` chunks; others only
-    yield ``content`` pieces.
+    Pass ``think`` only for models that advertise the ``thinking`` capability (see
+    ``get_chat_think_param``); with ``think`` set, thinking-capable models emit ``message.thinking``
+    chunks; otherwise only ``content`` pieces are yielded.
     """
     client = _ollama_client()
     kwargs: dict[str, Any] = {}
@@ -292,13 +293,43 @@ def chat_stream(
             yield "content", c
 
 
-def _format_assistant_stream_markdown(thinking: str, content: str) -> str:
+def get_chat_think_param(
+    client: ollama.Client, model: str
+) -> bool | Literal["low", "medium", "high"] | None:
+    """Value for Ollama ``think`` on chat requests, or ``None`` to omit (no thinking capability).
+
+    Uses ``/api/show`` ``capabilities``; caches per model name in session state.
+    GPT-OSS expects a level instead of a boolean, so we pass ``\"medium\"`` when the model name
+    matches that family.
+    """
+    name = (model or "").strip()
+    if not name:
+        return None
+    cache_key = f"ollama_model_caps::{name}"
+    if cache_key not in st.session_state:
+        try:
+            info = client.show(name)
+            caps = getattr(info, "capabilities", None) or []
+            st.session_state[cache_key] = tuple(caps)
+        except Exception:
+            st.session_state[cache_key] = ()
+    caps: tuple[Any, ...] = st.session_state[cache_key]
+    if "thinking" not in caps:
+        return None
+    if "gpt-oss" in name.lower():
+        return "medium"
+    return True
+
+
+def _format_assistant_stream_markdown(
+    thinking: str, content: str, *, include_thinking: bool = True
+) -> str:
     parts: list[str] = []
-    if thinking:
+    if include_thinking and thinking:
         parts.append("**Thinking**\n\n")
         parts.append(thinking)
     if content:
-        if thinking:
+        if include_thinking and thinking:
             parts.append("\n\n---\n\n")
         parts.append(content)
     return "".join(parts)
@@ -522,15 +553,24 @@ def main() -> None:
                 try:
                     st.session_state.active_generation_model = model
                     keep_alive = 0 if st.session_state.get("unload_after_response") else None
-                    for kind, piece in chat_stream(model, messages, keep_alive=keep_alive):
+                    think_param = get_chat_think_param(client, model)
+                    show_thinking = think_param is not None
+                    for kind, piece in chat_stream(
+                        model, messages, keep_alive=keep_alive, think=think_param
+                    ):
                         if kind == "thinking":
                             thinking_buf += piece
                         else:
                             content_buf += piece
                         placeholder.markdown(
-                            _format_assistant_stream_markdown(thinking_buf, content_buf) + "▌"
+                            _format_assistant_stream_markdown(
+                                thinking_buf, content_buf, include_thinking=show_thinking
+                            )
+                            + "▌"
                         )
-                    full = _format_assistant_stream_markdown(thinking_buf, content_buf)
+                    full = _format_assistant_stream_markdown(
+                        thinking_buf, content_buf, include_thinking=show_thinking
+                    )
                     placeholder.markdown(full)
                 except Exception as e:
                     placeholder.error(str(e))

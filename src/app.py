@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from typing import Any, Iterator, Literal
 
 import ollama
@@ -29,10 +30,22 @@ def _ollama_client() -> ollama.Client:
     return ollama.Client(host=OLLAMA_HOST)
 
 
-def run_systemctl(action: str) -> tuple[int, str, str]:
-    """Run systemctl start|stop|status ollama. Returns (code, stdout, stderr)."""
+def run_ollama_service(action: str) -> tuple[int, str, str]:
+    """Start/stop/query the Ollama OS service. action: start|stop|status|is-active."""
     if action not in ("start", "stop", "status", "is-active"):
-        raise ValueError("invalid systemctl action")
+        raise ValueError("invalid service action")
+    if sys.platform == "win32":
+        if action in ("start", "stop"):
+            cmd = ["net", action, "Ollama"]
+        else:
+            cmd = ["sc", "query", "Ollama"]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
     result = subprocess.run(
         ["systemctl", action, "ollama"],
         capture_output=True,
@@ -44,7 +57,17 @@ def run_systemctl(action: str) -> tuple[int, str, str]:
 
 def ollama_service_active() -> bool | None:
     """True if active, False if inactive, None if status could not be determined."""
-    code, out, _err = run_systemctl("is-active")
+    if sys.platform == "win32":
+        code, out, _err = run_ollama_service("is-active")
+        if code != 0:
+            return None
+        u = out.upper()
+        if "RUNNING" in u:
+            return True
+        if "STOPPED" in u:
+            return False
+        return None
+    code, out, _err = run_ollama_service("is-active")
     if code == 0 and out == "active":
         return True
     if code in (3, 0) and out == "inactive":
@@ -391,23 +414,23 @@ def main() -> None:
     client = _ollama_client()
 
     st.title("Ollama")
-    st.caption("Local models · systemd service · streaming chat")
+    st.caption("Local models · service control · streaming chat")
 
     model = ""
     with st.sidebar:
         st.subheader("Ollama service")
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("Start", width="stretch", help="systemctl start ollama"):
-                code, out, err = run_systemctl("start")
+            if st.button("Start", width="stretch", help="Start the Ollama background service"):
+                code, out, err = run_ollama_service("start")
                 if code == 0:
                     st.success("Started.")
                 else:
                     st.error(err or out or f"Exit {code}")
                 st.rerun()
         with col_b:
-            if st.button("Stop", width="stretch", help="systemctl stop ollama"):
-                code, out, err = run_systemctl("stop")
+            if st.button("Stop", width="stretch", help="Stop the Ollama background service"):
+                code, out, err = run_ollama_service("stop")
                 if code == 0:
                     st.success("Stopped.")
                 else:
@@ -416,11 +439,11 @@ def main() -> None:
 
         active = ollama_service_active()
         if active is True:
-            st.success("systemd: **active**")
+            st.success("Ollama service: **running**")
         elif active is False:
-            st.warning("systemd: **inactive**")
+            st.warning("Ollama service: **stopped**")
         else:
-            st.info("systemd: could not read `is-active` (permissions?)")
+            st.info("Ollama service: could not detect state (permissions or install layout?)")
 
         st.divider()
         st.subheader("Downloaded models")

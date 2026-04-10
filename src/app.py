@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import shutil
+import urllib.request
 from typing import Any, Iterator, Literal
 
 import ollama
@@ -10,6 +13,19 @@ import pandas as pd
 import streamlit as st
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _daemon_reachable() -> bool:
+    """Check whether Ollama HTTP daemon responds on configured host."""
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=2) as resp:
+            return 200 <= getattr(resp, "status", 0) < 300
+    except Exception:
+        return False
 
 def ollama_stop(model: str) -> tuple[int, str, str]:
     """Stop/unload a model via `ollama stop <model>`."""
@@ -33,13 +49,19 @@ def run_systemctl(action: str) -> tuple[int, str, str]:
     """Run systemctl start|stop|status ollama. Returns (code, stdout, stderr)."""
     if action not in ("start", "stop", "status", "is-active"):
         raise ValueError("invalid systemctl action")
-    result = subprocess.run(
-        ["systemctl", action, "ollama"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    return result.returncode, result.stdout.strip(), result.stderr.strip()
+    if shutil.which("systemctl") is None:
+        return 127, "", "`systemctl` is not available on this OS."
+    try:
+        result = subprocess.run(
+            ["systemctl", action, "ollama"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except FileNotFoundError:
+        # Guard against PATH changes between lookup and execution.
+        return 127, "", "`systemctl` is not available on this OS."
 
 
 def ollama_service_active() -> bool | None:
@@ -50,6 +72,49 @@ def ollama_service_active() -> bool | None:
     if code in (3, 0) and out == "inactive":
         return False
     return None
+
+
+def run_windows_service(action: str) -> tuple[int, str, str]:
+    """Run start/stop/status for Ollama daemon on Windows."""
+    if action not in ("start", "stop", "status"):
+        raise ValueError("invalid windows service action")
+
+    if action == "status":
+        return (0, "active", "") if _daemon_reachable() else (3, "inactive", "")
+
+    if shutil.which("ollama") is None:
+        return 127, "", "`ollama` is not available on PATH."
+
+    try:
+        if action == "start":
+            flags = 0
+            if _is_windows():
+                flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+            return 0, "Started `ollama serve`.", ""
+
+        # action == "stop"
+        result = subprocess.run(
+            ["taskkill", "/IM", "ollama.exe", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        if result.returncode != 0 and "not found" in (out + " " + err).lower():
+            return 0, "No running `ollama.exe` process found.", ""
+        return result.returncode, out, err
+    except FileNotFoundError:
+        return 127, "", "Required Windows command is unavailable."
+    except Exception as e:
+        return 1, "", str(e)
 
 
 def list_models_raw() -> tuple[list[Any], str | None]:
@@ -391,36 +456,70 @@ def main() -> None:
     client = _ollama_client()
 
     st.title("Ollama")
-    st.caption("Local models · systemd service · streaming chat")
+    st.caption("Local models · service control · streaming chat")
 
     model = ""
     with st.sidebar:
         st.subheader("Ollama service")
+        has_systemctl = shutil.which("systemctl") is not None
+        is_windows = _is_windows()
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("Start", width="stretch", help="systemctl start ollama"):
-                code, out, err = run_systemctl("start")
+            start_disabled = (not has_systemctl) and (not is_windows)
+            if st.button(
+                "Start",
+                width="stretch",
+                help="systemctl start ollama" if has_systemctl else "ollama serve",
+                disabled=start_disabled,
+            ):
+                if has_systemctl:
+                    code, out, err = run_systemctl("start")
+                elif is_windows:
+                    code, out, err = run_windows_service("start")
+                else:
+                    code, out, err = (127, "", "No supported service manager for this OS.")
                 if code == 0:
                     st.success("Started.")
                 else:
                     st.error(err or out or f"Exit {code}")
                 st.rerun()
         with col_b:
-            if st.button("Stop", width="stretch", help="systemctl stop ollama"):
-                code, out, err = run_systemctl("stop")
+            stop_disabled = (not has_systemctl) and (not is_windows)
+            if st.button(
+                "Stop",
+                width="stretch",
+                help="systemctl stop ollama" if has_systemctl else "taskkill ollama.exe",
+                disabled=stop_disabled,
+            ):
+                if has_systemctl:
+                    code, out, err = run_systemctl("stop")
+                elif is_windows:
+                    code, out, err = run_windows_service("stop")
+                else:
+                    code, out, err = (127, "", "No supported service manager for this OS.")
                 if code == 0:
                     st.success("Stopped.")
                 else:
                     st.error(err or out or f"Exit {code}")
                 st.rerun()
 
-        active = ollama_service_active()
-        if active is True:
-            st.success("systemd: **active**")
-        elif active is False:
-            st.warning("systemd: **inactive**")
+        if has_systemctl:
+            active = ollama_service_active()
+            if active is True:
+                st.success("systemd: **active**")
+            elif active is False:
+                st.warning("systemd: **inactive**")
+            else:
+                st.info("systemd: could not read `is-active` (permissions?)")
+        elif is_windows:
+            code, out, _err = run_windows_service("status")
+            if code == 0 and out == "active":
+                st.success("Windows daemon: **active**")
+            else:
+                st.warning("Windows daemon: **inactive**")
+            st.caption("On Windows, Start launches `ollama serve`; Stop ends `ollama.exe`.")
         else:
-            st.info("systemd: could not read `is-active` (permissions?)")
+            st.info("Service control via `systemctl` is unavailable on this OS.")
 
         st.divider()
         st.subheader("Downloaded models")
